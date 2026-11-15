@@ -5,7 +5,8 @@ database client: one driver for every engine that speaks it, served to SpelaionD
 
 SpelaionDB's engines are programs it starts and talks to over their standard input and output
 (its ADR-041). This one serves a generic `flightsql` connection and named ones for Dremio
-(`dremio`) and GizmoSQL (`gizmosql`). Flight SQL's results are Arrow, which is what SpelaionDB
+(`dremio`) and GizmoSQL (`gizmosql`); InfluxDB 3 is a `flightsql` connection whose database is
+sent as the `database` header. Flight SQL's results are Arrow, which is what SpelaionDB
 itself uses: they reach it without passing through any text. It is built here, in its own
 repository, and SpelaionDB pins by hash the exact release it was tested with (its ADR-042,
 ADR-055).
@@ -22,10 +23,11 @@ ADR-055).
 ci/services.sh
 ```
 
-starts the test servers (GizmoSQL and Dremio OSS in Docker, and Dremio's first user), and
+starts the test servers (GizmoSQL, Dremio OSS and InfluxDB 3 Core in Docker, and Dremio's first
+user), and
 
 ```bash
-SPELAION_TEST_GIZMOSQL=127.0.0.1:31337 SPELAION_TEST_DREMIO=127.0.0.1:32010 cargo test
+SPELAION_TEST_GIZMOSQL=127.0.0.1:31337 SPELAION_TEST_DREMIO=127.0.0.1:32010 \n  SPELAION_TEST_INFLUXDB=127.0.0.1:18181 cargo test
 ```
 
 runs the tests and the protocol's conformance set against this plugin's own program, for each
