@@ -1,0 +1,34 @@
+# The servers this plugin's tests run against.
+#
+# GizmoSQL 1.42 (DuckDB behind Flight SQL) on 127.0.0.1:31337 (SPELAION_TEST_GIZMOSQL), user
+# `spelaion`, password `spelaion`; Dremio OSS 26 on 127.0.0.1:32010 (SPELAION_TEST_DREMIO, Flight)
+# and 127.0.0.1:19047 (its web interface, where `ci/services.sh` makes the user `spelaion` with
+# the password `spelaion123`). Neither serves TLS here.
+name: spelaiondb-plugin-flightsql-test
+
+services:
+  gizmosql:
+    # v1.42.3, by digest: the build these tests were written against.
+    image: gizmodata/gizmosql@sha256:88e9d292d6cfe2f41e28d3baab24230691bf07af671b2329d226689fe5634150
+    environment:
+      GIZMOSQL_USERNAME: spelaion
+      GIZMOSQL_PASSWORD: spelaion
+      TLS_ENABLED: "0"
+    ports:
+      - "127.0.0.1:31337:31337"
+    healthcheck:
+      # The Flight port accepts connections once the server serves.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/31337' || exit 1"]
+      interval: 2s
+      retries: 60
+
+  dremio:
+    # 26.0.5, by digest.
+    image: dremio/dremio-oss@sha256:b030b5dbffe2c789de51543763551c6b1fb6737c1030172a3a2d3b83c031588a
+    ports:
+      - "127.0.0.1:19047:9047"
+      - "127.0.0.1:32010:32010"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9047/ > /dev/null || exit 1"]
+      interval: 3s
+      retries: 100
