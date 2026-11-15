@@ -3,7 +3,9 @@
 # GizmoSQL 1.42 (DuckDB behind Flight SQL) on 127.0.0.1:31337 (SPELAION_TEST_GIZMOSQL), user
 # `spelaion`, password `spelaion`; Dremio OSS 26 on 127.0.0.1:32010 (SPELAION_TEST_DREMIO, Flight)
 # and 127.0.0.1:19047 (its web interface, where `ci/services.sh` makes the user `spelaion` with
-# the password `spelaion123`). Neither serves TLS here.
+# the password `spelaion123`); InfluxDB 3 Core on 127.0.0.1:18181 (SPELAION_TEST_INFLUXDB, Flight SQL
+# and its HTTP API on one port, no authentication, data in memory). None serves TLS here. Each
+# server's memory is capped, so a test machine shared with other suites is not run out of it.
 name: spelaiondb-plugin-flightsql-test
 
 services:
@@ -32,3 +34,15 @@ services:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9047/ > /dev/null || exit 1"]
       interval: 3s
       retries: 100
+
+  influxdb:
+    # InfluxDB 3 Core 3.12.2, by digest. It chooses the database by a `database` header.
+    image: influxdb@sha256:f349b303abfc33e5be9ab67f475d544c4ef53ed5b3b68267842aedb112756b82
+    command: [influxdb3, serve, --node-id, spelaion, --object-store, memory, --without-auth]
+    mem_limit: 1g
+    ports:
+      - "127.0.0.1:18181:8181"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8181/health > /dev/null || exit 1"]
+      interval: 2s
+      retries: 60

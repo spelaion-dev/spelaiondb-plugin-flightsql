@@ -14,6 +14,10 @@
 //! The catalog comes from Flight SQL's own metadata calls: catalogs (the explorer's databases),
 //! schemas and tables, with each table's Arrow schema for its columns.
 //!
+//! A connection's database also goes with every call as a `database` header ([`Calls`]): the
+//! handshake, statements, results, metadata and cancels. InfluxDB 3 chooses the database by it
+//! (its catalog is always `public`); other servers ignore a header they do not know.
+//!
 //! Declared, so SpelaionDB hides it: transactions, editing, importing, binding values, plans.
 //! SpelaionDB gives these engines no read-only mode and no agents (no barrier of ours).
 
@@ -88,7 +92,11 @@ impl Driver for FlightSqlDriver {
         let channel =
             channel::open(&params.host, params.port, params.connect_addr, tls, timeout).await?;
         let scrub = Scrub(params.password.clone());
-        let mut client = FlightSqlServiceClient::new(channel.clone());
+        let mut calls = Calls {
+            token: None,
+            database: database_header(&params.database),
+        };
+        let mut client = calls.sql_client(&channel);
         let password = params.password.as_ref().map(Secret::expose).unwrap_or("");
         if !params.user.is_empty() || !password.is_empty() {
             match tokio::time::timeout(timeout, client.handshake(&params.user, password)).await {
@@ -106,7 +114,7 @@ impl Driver for FlightSqlDriver {
                 }
             }
         }
-        let token = client.token().cloned();
+        calls.token = client.token().cloned();
         let catalog = (!params.database.is_empty()).then(|| params.database.clone());
         let (cancel_tx, _) = watch::channel(0u64);
         Ok(Box::new(FlightSqlConnection {
@@ -120,8 +128,9 @@ impl Driver for FlightSqlDriver {
                 bound_params: false,
             },
             channel,
-            token,
+            calls,
             catalog: Mutex::new(catalog),
+            listed: Mutex::new(None),
             cancel: Arc::new(Cancel {
                 sent: AtomicU64::new(0),
                 upto: cancel_tx,
@@ -130,6 +139,50 @@ impl Driver for FlightSqlDriver {
             scrub,
         }))
     }
+}
+
+/// What goes with every call: the bearer token the handshake gave and the connection's database.
+#[derive(Clone)]
+struct Calls {
+    token: Option<String>,
+    /// The `database` header, when the connection names one that can travel as a header.
+    database: Option<String>,
+}
+
+impl Calls {
+    fn sql_client(&self, channel: &Channel) -> FlightSqlServiceClient<Channel> {
+        let mut client = FlightSqlServiceClient::new(channel.clone());
+        if let Some(token) = &self.token {
+            client.set_token(token.clone());
+        }
+        if let Some(database) = &self.database {
+            client.set_header("database", database.clone());
+        }
+        client
+    }
+
+    /// The plain Flight client a cancel goes through, with the same headers; `None` when one
+    /// cannot be set (the cancel is then not sent, as it is best effort).
+    fn flight_client(&self, channel: &Channel) -> Option<FlightClient> {
+        let mut client = FlightClient::new(channel.clone());
+        if let Some(token) = &self.token {
+            client
+                .add_header("authorization", &format!("Bearer {token}"))
+                .ok()?;
+        }
+        if let Some(database) = &self.database {
+            client.add_header("database", database).ok()?;
+        }
+        Some(client)
+    }
+}
+
+/// The `database` header for a connection's database: none when it names none, and none when
+/// the name cannot be a header value (gRPC metadata is visible ASCII), so a server that reads
+/// catalogs by name is still reached; InfluxDB 3's database names are ASCII.
+fn database_header(database: &str) -> Option<String> {
+    let valid = !database.is_empty() && database.bytes().all(|b| (0x20..0x7f).contains(&b));
+    valid.then(|| database.to_string())
 }
 
 /// Takes the password out of what the server or the transport says.
@@ -175,10 +228,13 @@ impl CancelHandle for FlightSqlCancel {
 struct FlightSqlConnection {
     capabilities: Capabilities,
     channel: Channel,
-    /// The bearer token the handshake gave, sent with every call.
-    token: Option<String>,
+    /// The token and the database header, sent with every call.
+    calls: Calls,
     /// The catalog the explorer shows (Flight SQL has no session catalog to change).
     catalog: Mutex<Option<String>>,
+    /// Whether the server lists the catalog named here as one of its catalogs, asked once per
+    /// name: a database that is no catalog (InfluxDB 3's, chosen by the header) filters nothing.
+    listed: Mutex<Option<(String, bool)>>,
     cancel: Arc<Cancel>,
     closed: Arc<AtomicBool>,
     scrub: Scrub,
@@ -222,15 +278,30 @@ fn classify(error: FlightError, scrub: &Scrub, closed: &AtomicBool) -> DriverErr
 
 impl FlightSqlConnection {
     fn client(&self) -> FlightSqlServiceClient<Channel> {
-        let mut client = FlightSqlServiceClient::new(self.channel.clone());
-        if let Some(token) = &self.token {
-            client.set_token(token.clone());
-        }
-        client
+        self.calls.sql_client(&self.channel)
     }
 
     fn current_catalog(&self) -> Option<String> {
         self.catalog.lock().expect("lock poisoned").clone()
+    }
+
+    /// The catalog the metadata calls filter by: the one chosen, when the server lists it as a
+    /// catalog. A database the server does not list as one (InfluxDB 3's, whose catalog is
+    /// always `public` and whose database travels as the header) filters nothing.
+    async fn catalog_filter(&self) -> Result<Option<String>> {
+        let Some(catalog) = self.current_catalog() else {
+            return Ok(None);
+        };
+        let known = self.listed.lock().expect("lock poisoned").clone();
+        let listed = match known {
+            Some((name, listed)) if name == catalog => listed,
+            _ => {
+                let listed = self.list_databases().await?.contains(&catalog);
+                *self.listed.lock().expect("lock poisoned") = Some((catalog.clone(), listed));
+                listed
+            }
+        };
+        Ok(listed.then_some(catalog))
     }
 
     fn error(&self, error: FlightError) -> DriverError {
@@ -263,7 +334,7 @@ impl FlightSqlConnection {
         let info = self
             .client()
             .get_tables(CommandGetTables {
-                catalog: self.current_catalog(),
+                catalog: self.catalog_filter().await?,
                 db_schema_filter_pattern: Some(schema.to_string()),
                 table_name_filter_pattern: table.map(str::to_string),
                 table_types: Vec::new(),
@@ -404,7 +475,7 @@ impl Connection for FlightSqlConnection {
         let (events, receiver) = mpsc::channel(4);
         let (started, answer) = oneshot::channel::<()>();
         let channel = self.channel.clone();
-        let token = self.token.clone();
+        let calls = self.calls.clone();
         let scrub = self.scrub.clone();
         let closed = self.closed.clone();
         let batch_size = opts.batch_size.max(1);
@@ -419,10 +490,7 @@ impl Connection for FlightSqlConnection {
                 {
                     return Ok(());
                 }
-                let mut client = FlightSqlServiceClient::new(channel.clone());
-                if let Some(token) = &token {
-                    client.set_token(token.clone());
-                }
+                let mut client = calls.sql_client(&channel);
                 for endpoint in &info.endpoint {
                     let Some(ticket) = endpoint.ticket.clone() else {
                         continue;
@@ -436,7 +504,7 @@ impl Connection for FlightSqlConnection {
                             next = stream.next() => next,
                             changed = cancel.changed() => {
                                 if changed.is_err() || *cancel.borrow() >= seq {
-                                    cancel_on_server(&channel, &token, &info).await;
+                                    cancel_on_server(&channel, &calls, &info).await;
                                     return Err(DriverError::Cancelled);
                                 }
                                 continue;
@@ -459,7 +527,7 @@ impl Connection for FlightSqlConnection {
                                 .is_err()
                             {
                                 // Nobody reads any more: the statement stops.
-                                cancel_on_server(&channel, &token, &info).await;
+                                cancel_on_server(&channel, &calls, &info).await;
                                 return Ok(());
                             }
                             offset += length;
@@ -553,7 +621,7 @@ impl Connection for FlightSqlConnection {
         let info = self
             .client()
             .get_db_schemas(CommandGetDbSchemas {
-                catalog: self.current_catalog(),
+                catalog: self.catalog_filter().await?,
                 db_schema_filter_pattern: None,
             })
             .await
@@ -664,19 +732,28 @@ impl Connection for FlightSqlConnection {
 }
 
 /// Asks the server to cancel the statement `info` answered for, where it can; best effort.
-async fn cancel_on_server(channel: &Channel, token: &Option<String>, info: &FlightInfo) {
-    let mut client = FlightClient::new(channel.clone());
-    if let Some(token) = token
-        && client
-            .add_header("authorization", &format!("Bearer {token}"))
-            .is_err()
-    {
+async fn cancel_on_server(channel: &Channel, calls: &Calls, info: &FlightInfo) {
+    let Some(mut client) = calls.flight_client(channel) else {
         return;
-    }
+    };
     let request = CancelFlightInfoRequest::new(info.clone());
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         client.cancel_flight_info(request),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::database_header;
+
+    #[test]
+    fn the_database_header_is_sent_only_for_a_name_a_header_can_carry() {
+        assert_eq!(database_header("sensors"), Some("sensors".into()));
+        assert_eq!(database_header("my db-2_x"), Some("my db-2_x".into()));
+        for none in ["", "caf\u{e9}", "a\nb", "tab\there"] {
+            assert_eq!(database_header(none), None, "{none:?}");
+        }
+    }
 }

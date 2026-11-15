@@ -21,16 +21,21 @@ says only what is different in this repository.
     another server (an endpoint with a location) are refused**: nothing leaves SpelaionDB's
     route. A cancel ends the gRPC call and sends `CancelFlightInfo`. Failures are told apart by
     their gRPC status (`Unavailable` loses the connection). The catalog comes from Flight SQL's
-    metadata calls; their name filters are patterns, so only exact names are kept.
+    metadata calls; their name filters are patterns, so only exact names are kept. A
+    connection's database goes with every call (handshake, statements, results, metadata and
+    cancels) as a `database` header, which InfluxDB 3 chooses its database by; the metadata
+    calls filter by it as a catalog only when the server lists it as one.
   - `types.rs`: each Arrow column cast to its logical type's Arrow type (the plugin converts,
     never the core); what Arrow cannot cast is written as Arrow writes it.
 - `src/bin/spelaiondb-plugin-flightsql.rs`: the program. It hands the drivers to
   `spelaion_plugin_sdk::run` and nothing else.
 - `tests/flightsql.rs`: values and their types, large results, errors, cancel, the catalog, the
   login and the route, against GizmoSQL (as `gizmosql` and as `flightsql`) and Dremio.
+  `tests/influxdb.rs`: InfluxDB 3 Core as `flightsql`, its database chosen by the header.
   `tests/conformance.rs`: SpelaionDB's conformance set for each engine, and `plugin.toml`.
 - `testing/compose.yaml` and `ci/services.sh`: the test servers (GizmoSQL on 31337, Dremio on
-  32010 with its first user made by the script), pinned by digest.
+  32010 with its first user made by the script, InfluxDB 3 Core on 18181), pinned by digest,
+  each with its memory capped.
 - `plugin.toml`: the protocol version, the engines and the lowest SpelaionDB of this plugin.
 
 ## A plugin is the wire, not the rules
